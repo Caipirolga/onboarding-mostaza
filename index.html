@@ -247,6 +247,7 @@ textarea{resize:vertical;min-height:52px}
         <p style="font-size:12px;font-weight:700;color:var(--mz-black);margin-bottom:4px">Importar perfiles</p>
         <textarea id="import-input" placeholder="Pega aqui el JSON exportado" style="margin:8px 0;font-size:11px"></textarea>
         <button class="btn primary" onclick="doImport()"><i class="ti ti-upload"></i> Importar</button>
+<div id="excel-import-block"></div>
       </div>
     </div>
   </div>
@@ -589,7 +590,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch
   ];
   const COL_FOTO = 'foto_nombre';
   const COL_FOTO_B64 = 'foto_base64'; // base64 directo (generado por fotos_a_excel.py)
-  const COL_FOTO_B64 = 'foto_base64'; // columna con base64 directo (generada por fotos_a_excel.py)
 
   // ─── Utilidades ────────────────────────────────────────────
 
@@ -1182,9 +1182,6 @@ if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch
 
 })();
 </script>
-</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-</body>
-</html>  
 </body>
 </html>
