@@ -542,35 +542,6 @@ function doImport(){
 }
 
 if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(function(){});}
-/**
- * ============================================================
- * MÓDULO: Importación Excel + Cruce de Fotos
- * Onboarding Game — Mostaza Comunicación
- * ============================================================
- *
- * INSTRUCCIONES DE INTEGRACIÓN:
- * 1. Añade SheetJS antes del cierre de </body>:
- *    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
- *
- * 2. Pega todo este script en tu index.html (antes del cierre </script> principal
- *    o en un bloque <script> separado al final del <body>).
- *
- * 3. En el panel de Admin, añade este HTML donde quieras el botón:
- *    <!-- INICIO: Bloque importación Excel -->
- *    <div id="excel-import-block">
- *      <!-- generado por initExcelImportUI() -->
- *    </div>
- *    <!-- FIN: Bloque importación Excel -->
- *    Y llama a initExcelImportUI() al cargar el panel de admin.
- *
- * COLUMNAS ESPERADAS EN EL EXCEL (fila 1 = cabeceras):
- *   nombre | email | departamento | antiguedad | como_soy | dato_curioso | plan_perfecto | peor_pesadilla | foto_nombre
- *
- * La columna "foto_nombre" es opcional: debe contener el nombre del
- * archivo de foto (ej: "maria.jpg"). Si existe una imagen cargada
- * en el panel con ese nombre, se cruza automáticamente.
- * ============================================================
- */
 
 (function () {
   'use strict';
