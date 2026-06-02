@@ -541,6 +541,650 @@ function doImport(){
 }
 
 if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(function(){});}
+/**
+ * ============================================================
+ * MÓDULO: Importación Excel + Cruce de Fotos
+ * Onboarding Game — Mostaza Comunicación
+ * ============================================================
+ *
+ * INSTRUCCIONES DE INTEGRACIÓN:
+ * 1. Añade SheetJS antes del cierre de </body>:
+ *    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+ *
+ * 2. Pega todo este script en tu index.html (antes del cierre </script> principal
+ *    o en un bloque <script> separado al final del <body>).
+ *
+ * 3. En el panel de Admin, añade este HTML donde quieras el botón:
+ *    <!-- INICIO: Bloque importación Excel -->
+ *    <div id="excel-import-block">
+ *      <!-- generado por initExcelImportUI() -->
+ *    </div>
+ *    <!-- FIN: Bloque importación Excel -->
+ *    Y llama a initExcelImportUI() al cargar el panel de admin.
+ *
+ * COLUMNAS ESPERADAS EN EL EXCEL (fila 1 = cabeceras):
+ *   nombre | email | departamento | antiguedad | como_soy | dato_curioso | plan_perfecto | peor_pesadilla | foto_nombre
+ *
+ * La columna "foto_nombre" es opcional: debe contener el nombre del
+ * archivo de foto (ej: "maria.jpg"). Si existe una imagen cargada
+ * en el panel con ese nombre, se cruza automáticamente.
+ * ============================================================
+ */
+
+(function () {
+  'use strict';
+
+  // ─── Constantes ────────────────────────────────────────────
+  const STORAGE_KEY = 'ob_mz7';
+  const FOTO_TEMP_KEY = 'ob_mz7_fotos_temp'; // cache temporal de fotos subidas
+  const AMARILLO = '#d4ac39';
+  const NEGRO = '#1a1a18';
+  const GRIS = '#5a5a52';
+
+  // Columnas requeridas (sin foto_nombre que es opcional)
+  const COLS_REQUIRED = [
+    'nombre', 'email', 'departamento',
+    'antiguedad', 'como_soy', 'dato_curioso',
+    'plan_perfecto', 'peor_pesadilla'
+  ];
+  const COL_FOTO = 'foto_nombre';
+  const COL_FOTO_B64 = 'foto_base64'; // base64 directo (generado por fotos_a_excel.py)
+  const COL_FOTO_B64 = 'foto_base64'; // columna con base64 directo (generada por fotos_a_excel.py)
+
+  // ─── Utilidades ────────────────────────────────────────────
+
+  function loadPerfiles() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    } catch {
+      return [];
+    }
+  }
+
+  function savePerfiles(perfiles) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(perfiles));
+  }
+
+  function loadFotosCache() {
+    try {
+      return JSON.parse(localStorage.getItem(FOTO_TEMP_KEY) || '{}');
+    } catch {
+      return {};
+    }
+  }
+
+  function saveFotosCache(cache) {
+    localStorage.setItem(FOTO_TEMP_KEY, JSON.stringify(cache));
+  }
+
+  function normalize(str) {
+    // Normaliza para comparar nombres de archivo/columnas
+    return (str || '').toString().toLowerCase().trim()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  }
+
+  function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2);
+  }
+
+  // ─── Parser Excel → Perfiles ────────────────────────────────
+
+  /**
+   * Lee un File (.xlsx/.xls/.csv) y devuelve Promise<{ ok, perfiles, errores }>
+   */
+  function parseExcelFile(file) {
+    return new Promise((resolve) => {
+      if (!window.XLSX) {
+        resolve({ ok: false, perfiles: [], errores: ['SheetJS no está cargado. Añade el script en el HTML.'] });
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const wb = XLSX.read(data, { type: 'array' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+
+          if (!rows.length) {
+            resolve({ ok: false, perfiles: [], errores: ['El archivo está vacío.'] });
+            return;
+          }
+
+          // Normalizar cabeceras
+          const rawHeaders = Object.keys(rows[0]);
+          const headerMap = {}; // normalized -> original
+          rawHeaders.forEach(h => { headerMap[normalize(h)] = h; });
+
+          // Verificar columnas requeridas
+          const missing = COLS_REQUIRED.filter(c => !headerMap[normalize(c)]);
+          if (missing.length) {
+            resolve({
+              ok: false, perfiles: [],
+              errores: [`Faltan columnas obligatorias: ${missing.join(', ')}`]
+            });
+            return;
+          }
+
+          const fotosCache = loadFotosCache();
+          const perfiles = [];
+          const errores = [];
+
+          rows.forEach((row, i) => {
+            const lineNum = i + 2; // fila 1 = cabecera
+            const nombre = (row[headerMap['nombre']] || '').toString().trim();
+            const email  = (row[headerMap['email']]  || '').toString().trim();
+
+            if (!nombre) {
+              errores.push(`Fila ${lineNum}: nombre vacío — omitida.`);
+              return;
+            }
+
+            // Cruce de foto — prioridad: foto_base64 > caché por foto_nombre
+            let fotoBase64 = '';
+
+            // 1. Columna foto_base64 (generada por fotos_a_excel.py) — flujo ideal
+            const colB64 = headerMap[normalize(COL_FOTO_B64)];
+            if (colB64) {
+              const b64val = (row[colB64] || '').toString().trim();
+              if (b64val.startsWith('data:image')) fotoBase64 = b64val;
+            }
+
+            // 2. Si no hay base64 directo, intentar cruce por nombre de archivo (caché Admin)
+            if (!fotoBase64) {
+              const colFoto = headerMap[normalize(COL_FOTO)];
+              if (colFoto) {
+                const nombreFoto = normalize(row[colFoto] || '');
+                if (nombreFoto) {
+                  const match = Object.keys(fotosCache).find(k => normalize(k) === nombreFoto);
+                  if (match) {
+                    fotoBase64 = fotosCache[match];
+                  } else {
+                    errores.push(`Fila ${lineNum} (${nombre}): foto "${row[colFoto]}" no encontrada en fotos subidas.`);
+                  }
+                }
+              }
+            }
+
+            perfiles.push({
+              id: generateId(),
+              nombre,
+              email,
+              foto: fotoBase64,
+              pistas: {
+                departamento: (row[headerMap['departamento']]  || '').toString().trim(),
+                antiguedad:   (row[headerMap['antiguedad']]   || '').toString().trim(),
+                como_soy:     (row[headerMap['como_soy']]     || '').toString().trim(),
+                dato_curioso: (row[headerMap['dato_curioso']] || '').toString().trim(),
+                plan_perfecto:(row[headerMap['plan_perfecto']] || '').toString().trim(),
+                peor_pesadilla:(row[headerMap['peor_pesadilla']] || '').toString().trim(),
+              }
+            });
+          });
+
+          resolve({ ok: true, perfiles, errores });
+        } catch (err) {
+          resolve({ ok: false, perfiles: [], errores: [`Error al leer el archivo: ${err.message}`] });
+        }
+      };
+      reader.onerror = () => resolve({ ok: false, perfiles: [], errores: ['No se pudo leer el archivo.'] });
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  // ─── Carga de fotos (múltiple) ──────────────────────────────
+
+  /**
+   * Lee múltiples imágenes y las guarda en el cache temporal.
+   * Returns Promise<{ cargadas, errores }>
+   */
+  function loadFotosToCache(files) {
+    const cache = loadFotosCache();
+    const promises = Array.from(files).map(file => {
+      return new Promise((resolve) => {
+        if (!file.type.startsWith('image/')) {
+          resolve({ ok: false, nombre: file.name, err: 'No es imagen' });
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          cache[file.name] = e.target.result; // base64 data URL
+          resolve({ ok: true, nombre: file.name });
+        };
+        reader.onerror = () => resolve({ ok: false, nombre: file.name, err: 'Error de lectura' });
+        reader.readAsDataURL(file);
+      });
+    });
+
+    return Promise.all(promises).then(results => {
+      saveFotosCache(cache);
+      return {
+        cargadas: results.filter(r => r.ok).map(r => r.nombre),
+        errores: results.filter(r => !r.ok).map(r => `${r.nombre}: ${r.err}`)
+      };
+    });
+  }
+
+  // ─── Importación final ──────────────────────────────────────
+
+  /**
+   * Opciones de merge: 'add' (solo nuevos), 'replace' (reemplaza todos), 'merge' (añade o actualiza por email)
+   */
+  function importarPerfiles(nuevos, modo) {
+    const existentes = loadPerfiles();
+    let resultado;
+
+    if (modo === 'replace') {
+      resultado = nuevos;
+    } else if (modo === 'merge') {
+      const mapa = {};
+      existentes.forEach(p => { if (p.email) mapa[p.email.toLowerCase()] = p; });
+      nuevos.forEach(p => {
+        if (p.email) mapa[p.email.toLowerCase()] = { ...mapa[p.email.toLowerCase()], ...p };
+        else existentes.push(p);
+      });
+      resultado = Object.values(mapa);
+    } else { // 'add'
+      const emailsExistentes = new Set(existentes.map(p => (p.email || '').toLowerCase()));
+      const soloNuevos = nuevos.filter(p => !emailsExistentes.has((p.email || '').toLowerCase()));
+      resultado = [...existentes, ...soloNuevos];
+    }
+
+    if (resultado.length > 50) {
+      return { ok: false, msg: `Límite de 50 perfiles. El resultado tendría ${resultado.length}.` };
+    }
+
+    savePerfiles(resultado);
+    return { ok: true, total: resultado.length, añadidos: resultado.length - existentes.length };
+  }
+
+  // ─── UI del Panel Admin ─────────────────────────────────────
+
+  function initExcelImportUI(containerId) {
+    containerId = containerId || 'excel-import-block';
+    const container = document.getElementById(containerId);
+    if (!container) {
+      console.warn('[ExcelImport] No se encontró el contenedor #' + containerId);
+      return;
+    }
+
+    container.innerHTML = `
+      <style>
+        #excel-import-block {
+          font-family: 'Montserrat', sans-serif;
+          margin-top: 24px;
+          border-top: 2px solid ${AMARILLO};
+          padding-top: 20px;
+        }
+        #excel-import-block h3 {
+          color: ${AMARILLO};
+          font-size: 1rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 1px;
+          margin-bottom: 16px;
+        }
+        .mz-import-section {
+          background: rgba(255,255,255,0.04);
+          border: 1px solid rgba(212,172,57,0.2);
+          border-radius: 8px;
+          padding: 16px;
+          margin-bottom: 14px;
+        }
+        .mz-import-section p {
+          color: #ccc;
+          font-size: 0.82rem;
+          margin: 0 0 10px 0;
+          line-height: 1.5;
+        }
+        .mz-file-label {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          background: ${AMARILLO};
+          color: ${NEGRO};
+          font-weight: 700;
+          font-size: 0.82rem;
+          padding: 8px 14px;
+          border-radius: 6px;
+          cursor: pointer;
+          transition: opacity .15s;
+        }
+        .mz-file-label:hover { opacity: 0.85; }
+        .mz-file-label input { display: none; }
+        .mz-btn {
+          background: ${AMARILLO};
+          color: ${NEGRO};
+          border: none;
+          font-family: 'Montserrat', sans-serif;
+          font-weight: 700;
+          font-size: 0.82rem;
+          padding: 8px 16px;
+          border-radius: 6px;
+          cursor: pointer;
+          transition: opacity .15s;
+          margin-top: 8px;
+        }
+        .mz-btn:hover { opacity: 0.85; }
+        .mz-btn:disabled { opacity: 0.4; cursor: default; }
+        .mz-btn-secondary {
+          background: transparent;
+          color: ${AMARILLO};
+          border: 1px solid ${AMARILLO};
+        }
+        .mz-select {
+          font-family: 'Montserrat', sans-serif;
+          font-size: 0.82rem;
+          background: ${NEGRO};
+          color: #eee;
+          border: 1px solid ${AMARILLO};
+          border-radius: 6px;
+          padding: 6px 10px;
+          margin-left: 8px;
+        }
+        .mz-status {
+          margin-top: 10px;
+          font-size: 0.8rem;
+          line-height: 1.5;
+          padding: 8px 12px;
+          border-radius: 6px;
+          display: none;
+        }
+        .mz-status.ok  { background: rgba(80,200,100,.12); color: #7ddd96; border: 1px solid rgba(80,200,100,.3); }
+        .mz-status.err { background: rgba(220,60,60,.12);  color: #f08080; border: 1px solid rgba(220,60,60,.3); }
+        .mz-status.warn { background: rgba(212,172,57,.1); color: ${AMARILLO}; border: 1px solid rgba(212,172,57,.3); }
+        .mz-fotos-list {
+          font-size: 0.76rem;
+          color: #aaa;
+          margin-top: 6px;
+          max-height: 80px;
+          overflow-y: auto;
+        }
+        .mz-fotos-list span { display: block; }
+        .mz-preview-table {
+          width: 100%;
+          border-collapse: collapse;
+          font-size: 0.75rem;
+          margin-top: 10px;
+          max-height: 180px;
+          overflow-y: auto;
+          display: block;
+        }
+        .mz-preview-table th {
+          background: rgba(212,172,57,.15);
+          color: ${AMARILLO};
+          padding: 5px 8px;
+          text-align: left;
+          position: sticky;
+          top: 0;
+        }
+        .mz-preview-table td {
+          color: #ccc;
+          padding: 4px 8px;
+          border-bottom: 1px solid rgba(255,255,255,.05);
+        }
+        .mz-preview-table tr:hover td { background: rgba(255,255,255,.03); }
+        .mz-badge {
+          display: inline-block;
+          background: rgba(212,172,57,.2);
+          color: ${AMARILLO};
+          border-radius: 20px;
+          font-size: 0.72rem;
+          font-weight: 700;
+          padding: 2px 8px;
+          margin-left: 6px;
+        }
+        .mz-divider { border: none; border-top: 1px solid rgba(255,255,255,.07); margin: 6px 0; }
+        #mz-dl-template {
+          font-size: 0.78rem;
+          color: ${AMARILLO};
+          text-decoration: underline;
+          cursor: pointer;
+          background: none;
+          border: none;
+          font-family: 'Montserrat', sans-serif;
+          padding: 0;
+        }
+        #mz-dl-template:hover { opacity: 0.8; }
+      </style>
+
+      <h3>📥 Importar desde Excel</h3>
+
+      <!-- PASO 1: Fotos -->
+      <div class="mz-import-section">
+        <p>
+          <strong style="color:${AMARILLO}">Paso 1 · Subir fotos</strong> (opcional)<br>
+          Sube los archivos de imagen antes de importar el Excel. Se cruzarán automáticamente
+          si la columna <code>foto_nombre</code> contiene el nombre exacto del archivo.
+        </p>
+        <label class="mz-file-label">
+          📷 Seleccionar fotos
+          <input type="file" id="mz-fotos-input" accept="image/*" multiple>
+        </label>
+        <div class="mz-fotos-list" id="mz-fotos-list"></div>
+        <div class="mz-status" id="mz-fotos-status"></div>
+      </div>
+
+      <!-- PASO 2: Excel -->
+      <div class="mz-import-section">
+        <p>
+          <strong style="color:${AMARILLO}">Paso 2 · Cargar Excel</strong><br>
+          Sube el archivo <code>.xlsx</code> o <code>.csv</code> con los perfiles.
+          <button id="mz-dl-template">Descargar plantilla de ejemplo</button>
+        </p>
+        <label class="mz-file-label">
+          📊 Seleccionar Excel
+          <input type="file" id="mz-excel-input" accept=".xlsx,.xls,.csv">
+        </label>
+        <div class="mz-status" id="mz-excel-status"></div>
+        <div id="mz-preview-wrap" style="display:none; margin-top:12px;">
+          <strong style="color:#ccc; font-size:0.82rem;">
+            Vista previa <span id="mz-preview-count" class="mz-badge">0</span>
+          </strong>
+          <table class="mz-preview-table" id="mz-preview-table">
+            <thead><tr>
+              <th>Nombre</th><th>Email</th><th>Departamento</th><th>Foto</th>
+            </tr></thead>
+            <tbody id="mz-preview-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- PASO 3: Importar -->
+      <div class="mz-import-section" id="mz-import-confirm" style="display:none;">
+        <p>
+          <strong style="color:${AMARILLO}">Paso 3 · Confirmar importación</strong><br>
+          Elige cómo combinar los nuevos perfiles con los existentes:
+        </p>
+        <label style="color:#ccc; font-size:0.82rem;">
+          Modo:
+          <select class="mz-select" id="mz-modo-select">
+            <option value="add">Añadir solo nuevos (por email)</option>
+            <option value="merge">Actualizar + añadir nuevos (por email)</option>
+            <option value="replace">Reemplazar todos los perfiles</option>
+          </select>
+        </label>
+        <br>
+        <button class="mz-btn" id="mz-import-btn">✅ Importar perfiles</button>
+        <div class="mz-status" id="mz-import-status"></div>
+      </div>
+    `;
+
+    // ── Referencias ──
+    const fotosInput     = document.getElementById('mz-fotos-input');
+    const fotosList      = document.getElementById('mz-fotos-list');
+    const fotosStatus    = document.getElementById('mz-fotos-status');
+    const excelInput     = document.getElementById('mz-excel-input');
+    const excelStatus    = document.getElementById('mz-excel-status');
+    const previewWrap    = document.getElementById('mz-preview-wrap');
+    const previewCount   = document.getElementById('mz-preview-count');
+    const previewBody    = document.getElementById('mz-preview-body');
+    const importConfirm  = document.getElementById('mz-import-confirm');
+    const importBtn      = document.getElementById('mz-import-btn');
+    const importStatus   = document.getElementById('mz-import-status');
+    const dlTemplate     = document.getElementById('mz-dl-template');
+
+    let perfilesParsed = []; // resultado del parse del Excel
+
+    // ── Helper: mostrar status ──
+    function showStatus(el, msg, type) {
+      el.style.display = 'block';
+      el.className = 'mz-status ' + type;
+      el.innerHTML = msg;
+    }
+
+    // ── Fotos ──
+    fotosInput.addEventListener('change', async () => {
+      if (!fotosInput.files.length) return;
+      fotosList.innerHTML = '<span>Cargando…</span>';
+      showStatus(fotosStatus, 'Procesando fotos…', 'warn');
+      const { cargadas, errores } = await loadFotosToCache(fotosInput.files);
+      fotosList.innerHTML = cargadas.map(n => `<span>✔ ${n}</span>`).join('');
+      if (errores.length) fotosList.innerHTML += errores.map(e => `<span style="color:#f08080">✖ ${e}</span>`).join('');
+      const total = Object.keys(loadFotosCache()).length;
+      showStatus(fotosStatus,
+        `${cargadas.length} foto(s) añadidas al caché · Total en caché: ${total}` +
+        (errores.length ? `<br>⚠ ${errores.join('<br>')}` : ''),
+        errores.length ? 'warn' : 'ok'
+      );
+    });
+
+    // ── Excel ──
+    excelInput.addEventListener('change', async () => {
+      if (!excelInput.files[0]) return;
+      showStatus(excelStatus, 'Leyendo archivo…', 'warn');
+      previewWrap.style.display = 'none';
+      importConfirm.style.display = 'none';
+      perfilesParsed = [];
+
+      const file = excelInput.files[0];
+      const { ok, perfiles, errores } = await parseExcelFile(file);
+
+      if (!ok) {
+        showStatus(excelStatus, '❌ ' + errores.join('<br>'), 'err');
+        return;
+      }
+
+      perfilesParsed = perfiles;
+
+      // Renderizar preview
+      previewBody.innerHTML = perfiles.map(p => `
+        <tr>
+          <td>${p.nombre}</td>
+          <td style="color:#888">${p.email || '—'}</td>
+          <td>${p.pistas.departamento || '—'}</td>
+          <td>${p.foto ? '✔ sí' : '—'}</td>
+        </tr>
+      `).join('');
+      previewCount.textContent = perfiles.length;
+      previewWrap.style.display = 'block';
+      importConfirm.style.display = 'block';
+
+      const warnMsg = errores.length
+        ? `✔ ${perfiles.length} perfil(es) leído(s) con ${errores.length} aviso(s):<br>${errores.join('<br>')}`
+        : `✔ ${perfiles.length} perfil(es) leído(s) correctamente.`;
+      showStatus(excelStatus, warnMsg, errores.length ? 'warn' : 'ok');
+    });
+
+    // ── Importar ──
+    importBtn.addEventListener('click', () => {
+      if (!perfilesParsed.length) return;
+      const modo = document.getElementById('mz-modo-select').value;
+      const confirm = window.confirm(
+        `¿Importar ${perfilesParsed.length} perfil(es) en modo "${modo}"?\n` +
+        (modo === 'replace' ? '⚠ ATENCIÓN: se eliminarán todos los perfiles existentes.' : '')
+      );
+      if (!confirm) return;
+
+      importBtn.disabled = true;
+      const result = importarPerfiles(perfilesParsed, modo);
+      importBtn.disabled = false;
+
+      if (result.ok) {
+        showStatus(importStatus,
+          `✅ Importación completada. Total de perfiles: ${result.total}.`,
+          'ok'
+        );
+        perfilesParsed = [];
+        excelInput.value = '';
+        previewWrap.style.display = 'none';
+        importConfirm.style.display = 'none';
+        excelStatus.style.display = 'none';
+        // Disparar evento para que el resto de la app actualice la UI
+        document.dispatchEvent(new CustomEvent('ob:perfiles-updated'));
+      } else {
+        showStatus(importStatus, '❌ ' + result.msg, 'err');
+      }
+    });
+
+    // ── Plantilla de ejemplo ──
+    dlTemplate.addEventListener('click', () => {
+      if (!window.XLSX) {
+        alert('SheetJS no está cargado. No se puede generar la plantilla.');
+        return;
+      }
+      const datos = [
+        {
+          nombre: 'Ana García',
+          email: 'ana.garcia@mostaza.com',
+          departamento: 'Marketing',
+          antiguedad: '3 años',
+          como_soy: 'Creativa, directa y con mucha energía por la mañana.',
+          dato_curioso: 'He vivido en 4 países diferentes.',
+          plan_perfecto: 'Un fin de semana en la montaña sin móvil.',
+          peor_pesadilla: 'Una reunión de 3 horas sin orden del día.',
+          foto_nombre: 'ana.jpg'
+        },
+        {
+          nombre: 'Luis Martínez',
+          email: 'luis.martinez@mostaza.com',
+          departamento: 'Diseño',
+          antiguedad: '1 año',
+          como_soy: 'Perfeccionista (en el buen sentido) y muy visual.',
+          dato_curioso: 'Colecciono fuentes tipográficas raras.',
+          plan_perfecto: 'Un concierto y luego brunch el domingo.',
+          peor_pesadilla: 'Que me pidan Comic Sans.',
+          foto_nombre: 'luis.png'
+        }
+      ];
+      const ws = XLSX.utils.json_to_sheet(datos);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Perfiles');
+      XLSX.writeFile(wb, 'plantilla_onboarding_mostaza.xlsx');
+    });
+
+    // Actualizar lista de fotos en caché al iniciar
+    const cache = loadFotosCache();
+    const keys = Object.keys(cache);
+    if (keys.length) {
+      fotosList.innerHTML = keys.map(k => `<span>📷 ${k}</span>`).join('');
+      showStatus(fotosStatus, `${keys.length} foto(s) en caché.`, 'ok');
+    }
+  }
+
+  // Exponer al scope global
+  window.MzExcelImport = {
+    init: initExcelImportUI,
+    parseExcelFile,
+    importarPerfiles,
+    loadFotosToCache,
+    clearFotosCache: () => localStorage.removeItem(FOTO_TEMP_KEY)
+  };
+
+  // Auto-init si existe el contenedor
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      if (document.getElementById('excel-import-block')) initExcelImportUI();
+    });
+  } else {
+    if (document.getElementById('excel-import-block')) initExcelImportUI();
+  }
+
+})();
 </script>
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</body>
+</html>  
 </body>
 </html>
